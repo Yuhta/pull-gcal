@@ -1,0 +1,325 @@
+#!/usr/bin/python
+
+import os
+import re
+import urllib
+import xml.etree.ElementTree as ElementTree
+from datetime import datetime, date, timedelta
+from calendar import monthrange
+import os.path
+import time
+
+CFG_DIR = os.getenv("HOME") + "/.pull-gcal/"
+CFG_FILE = CFG_DIR + "pull-gcal.conf"
+
+_STR_DATE = r"(\d{4})-?(\d{2})-?(\d{2})"
+_STR_TIME = r"T(\d{2}):?(\d{2}):?(\d{2})"
+
+_PATTERN_ID = re.compile(r".*/?([^/]+)$")
+_PATTERN_TIME = re.compile(_STR_DATE + _STR_TIME)
+_PATTERN_TIME_ALLDAY = re.compile(_STR_DATE + r"$")
+_PATTERN_DTSTART = re.compile(r"^DTSTART;[^:]*:([0-9T]+)$", re.M)
+_PATTERN_DTEND = re.compile(r"^DTEND;[^:]*:([0-9T]+)$", re.M)
+_PATTERN_RRULE = re.compile(r"^RRULE:(.*)$", re.M)
+_PATTERN_RRULE_FREQ = re.compile(r"FREQ=([A-Z]+)")
+_PATTERN_RRULE_INTERVAL = re.compile(r"INTERVAL=(\d+)")
+_PATTERN_RRULE_COUNT = re.compile(r"COUNT=(\d+)")
+_PATTERN_RRULE_UNTIL = re.compile(r"UNTIL=(\d{8}(T\d{6})?)")
+_PATTERN_RRULE_BYDAY =\
+    re.compile(r"BYDAY=(\d?[A-Z]{2})(?:,(\d?[A-Z]{2}))*")
+_PATTERN_RRULE_BYMONTHDAY = re.compile(r"BYMONTHDAY=(\d+)")
+
+class GCalEntry:
+    def __init__(self, entry_id, title, start_time="", end_time=""):
+        self.id = _PATTERN_ID.match(entry_id).group(1)
+        self.title = title
+
+        m_time = _PATTERN_TIME.match(start_time)
+        m_time_allday = _PATTERN_TIME_ALLDAY.match(start_time)
+
+        if m_time:
+            self.start_time = datetime(int(m_time.group(1)),
+                                       int(m_time.group(2)),
+                                       int(m_time.group(3)),
+                                       int(m_time.group(4)),
+                                       int(m_time.group(5)),
+                                       int(m_time.group(6)))
+            m_time = _PATTERN_TIME.match(end_time)
+            self.end_time = datetime(int(m_time.group(1)),
+                                     int(m_time.group(2)),
+                                     int(m_time.group(3)),
+                                     int(m_time.group(4)),
+                                     int(m_time.group(5)),
+                                     int(m_time.group(6)))
+
+        elif m_time_allday:
+            self.start_time = date(int(m_time_allday.group(1)),
+                                   int(m_time_allday.group(2)),
+                                   int(m_time_allday.group(3)))
+            m_time_allday = _PATTERN_TIME_ALLDAY.match(end_time)
+            self.end_time = date(int(m_time_allday.group(1)),
+                                 int(m_time_allday.group(2)),
+                                 int(m_time_allday.group(3)))
+            self.end_time -= timedelta(1)
+
+class GCal:
+    class Cycle:
+        def __init__(self, cycle_type,
+                     s_byday=None, start_weekday=None,
+                     s_bymonthday=None):
+            if cycle_type == "daily":
+                self.next = self.next_day
+
+            elif cycle_type == "weekly":
+                self.next = self.next_week
+                DAYTONUM = {"MO": 0, "TU": 1, "WE": 2, "TH": 3,
+                            "FR": 4, "SA": 5, "SU": 6}
+
+                byday_r = [DAYTONUM[day] for day in s_byday.groups()]
+                byday_r.sort()
+                start = byday_r.index(start_weekday)
+                byday = byday_r[start:] + byday_r[:start]
+                
+                byday_shift = byday[1:] + byday[:1]
+                self.steps = [(byday_shift[i] - byday[i] + 7) % 7\
+                                  for i in range(len(byday))]
+                self.step_i = 0
+
+            elif cycle_type == "monthly":
+                if s_bymonthday:
+                    self.next = self.next_month_bymonthday
+
+                elif s_byday:
+                    self.next = self.next_month_byday
+                    self.order = int(s_byday.group(1)[0])
+
+            elif cycle_type == "yearly":
+                self.next = self.next_year
+
+        def next_day(self, time):
+            return time + timedelta(1)
+
+        def next_week(self, time):
+            r = time + timedelta(self.steps[self.step_i])
+            self.step_i = (self.step_i + 1) % len(self.steps)
+            return r
+
+        def next_month_bymonthday(self, time):
+            d = time.day
+            m = time.month + 1
+            y = time.year
+
+            while True:
+                if m > 12:
+                    m = 1
+                    y += 1
+                elif d > monthrange(y, m)[1]:
+                    m += 1
+                else:
+                    break
+
+            return time.replace(y, m, d)
+
+        def next_month_byday(self, time):
+            r = time
+            while r.month == time.month:
+                r += timedelta(7)
+            for i in range(self.order - 1):
+                r += timedelta(7)
+            return r
+
+        def next_year(self, time):
+            return time.replace(time.year + 1)
+
+    def __init__(self, name):
+        self.name = name
+        self.entries = []
+
+    def _iterate(self, next_time):
+        FORESEE_DAYS = 90
+
+        entry_id = self.entries[-1].id
+        title = self.entries[-1].title
+
+        start_time = self.entries[-1].start_time
+        end_time = self.entries[-1].end_time
+        duration = end_time - start_time
+
+        if self.s_interval:
+            interval = range(int(self.s_interval.group(1)))
+        else:
+            interval = range(1)
+
+        if self.s_count:
+            count = int(self.s_count.group(1))
+            for i in range(count - 1):
+                for j in interval:
+                    start_time = next_time(start_time)
+                self.entries.append(GCalEntry(entry_id, title))
+                self.entries[-1].start_time = start_time
+                self.entries[-1].end_time = start_time + duration
+
+        else:
+            if start_time.__class__.__name__ == "date":
+                if self.s_until:
+                    until = datetime.\
+                        strptime(self.s_until.group(1), "%Y%m%d").date()
+                else:
+                    until = date.today() + timedelta(FORESEE_DAYS)
+
+            else:
+                if self.s_until:
+                    until = datetime.strptime(self.s_until.group(1),
+                                              "%Y%m%dT%H%M%S")
+                else:
+                    until = datetime.today() + timedelta(FORESEE_DAYS)
+
+            for j in interval:
+                start_time = next_time(start_time)
+            while start_time < until:
+                self.entries.append(GCalEntry(entry_id, title))
+                self.entries[-1].start_time = start_time
+                self.entries[-1].end_time = start_time + duration
+                for j in interval:
+                    start_time = next_time(start_time)
+
+    def _add_recur(self, entry_id, title, recurrence):
+        dtstart = _PATTERN_DTSTART.search(recurrence).group(1)
+        dtend = _PATTERN_DTEND.search(recurrence).group(1)
+        rrule = _PATTERN_RRULE.search(recurrence).group(1)
+
+        self.s_interval = None
+        self.s_count = None
+        self.s_until = None
+
+        freq = _PATTERN_RRULE_FREQ.search(rrule).group(1)
+        self.s_interval = _PATTERN_RRULE_INTERVAL.search(rrule)
+        self.s_count = _PATTERN_RRULE_COUNT.search(rrule)
+        self.s_until = _PATTERN_RRULE_UNTIL.search(rrule)
+        s_byday = _PATTERN_RRULE_BYDAY.search(rrule)
+        s_bymonthday = _PATTERN_RRULE_BYMONTHDAY.search(rrule)
+
+        self.entries.append(GCalEntry(entry_id, title, dtstart, dtend))
+
+        if freq == "DAILY":
+            daily = self.Cycle("daily")
+            self._iterate(daily.next)
+
+        elif freq == "WEEKLY":
+            weekly = self.Cycle("weekly", s_byday=s_byday,
+                                start_weekday=self.entries[-1]\
+                                    .start_time.weekday())
+            self._iterate(weekly.next)
+
+        elif freq == "MONTHLY":
+            monthly = self.Cycle("monthly",
+                                 s_byday=s_byday,
+                                 s_bymonthday=s_bymonthday)
+            self._iterate(monthly.next)
+
+        elif freq == "YEARLY":
+            yearly = self.Cycle("yearly")
+            self._iterate(yearly.next)
+
+    def parse(self):
+        NS = {"": "{http://www.w3.org/2005/Atom}",
+              "gd": "{http://schemas.google.com/g/2005}"}
+
+        local_xml = CFG_DIR + self.name + ".xml"
+        if os.path.exists(local_xml):
+            timer = time.time() - os.path.getmtime(local_xml)
+            if timer > self.timeout:
+                urllib.urlretrieve(self.xml, local_xml)
+        else:
+            urllib.urlretrieve(self.xml, local_xml)
+
+        tree = ElementTree.parse(local_xml)
+        root = tree.getroot()
+        canceled = []
+
+        for entry in root.iter(NS[""] + "entry"):
+            entry_id = entry.find(NS[""] + "id").text
+            title =\
+                entry.find(NS[""] + "title").text.encode("utf_8")
+            status = entry.find(NS["gd"] + "eventStatus")\
+                .attrib["value"][-8:]
+            when = entry.find(NS["gd"] + "when")
+            recurrence = entry.find(NS["gd"] + "recurrence")
+
+            if status == "canceled":
+                entry_id = entry.find(NS["gd"] + "originalEvent")\
+                    .attrib["href"]
+                canceled.append(GCalEntry(entry_id, title,
+                                          when.attrib["startTime"],
+                                          when.attrib["endTime"]))
+
+            elif when is not None:
+                self.entries.append(GCalEntry(entry_id, title,
+                                              when.attrib["startTime"],
+                                              when.attrib["endTime"]))
+
+            elif recurrence is not None:
+                self._add_recur(entry_id, title, recurrence.text)
+
+        for cancel in canceled:
+            for entry in self.entries:
+                if entry.id == cancel.id\
+                        and entry.start_time == cancel.start_time\
+                        and entry.end_time == cancel.end_time:
+                    self.entries.remove(entry)
+
+    def output_org(self):
+        print "*", self.name
+        for entry in self.entries:
+            print "**", entry.title
+
+            if entry.start_time.__class__.__name__ == "datetime":
+                if entry.start_time.date() == entry.end_time.date():
+                    print "   <"\
+                        + entry.start_time.strftime("%Y-%m-%d %a %H:%M")\
+                        + entry.end_time.strftime("-%H:%M")\
+                        + ">"
+                else:
+                    print "   <"\
+                        + entry.start_time.strftime("%Y-%m-%d %a %H:%M")\
+                        + ">--<"\
+                        + entry.end_time.strftime("%Y-%m-%d %a %H:%M")\
+                        + ">"
+
+            elif entry.start_time.__class__.__name__ == "date":
+                if entry.start_time == entry.end_time:
+                    print "   <"\
+                        + entry.start_time.strftime("%Y-%m-%d %a")\
+                        + ">"
+                else:
+                    print "   <"\
+                        + entry.start_time.strftime("%Y-%m-%d %a")\
+                        + ">--<"\
+                        + entry.end_time.strftime("%Y-%m-%d %a")\
+                        + ">"
+
+###############
+# Entry point #
+###############
+
+with open(CFG_FILE) as cfg:
+    PATTERN_CAL = re.compile(r"^\[(.*)\]$")
+    PATTERN_XML = re.compile(r"^xml=(.*)$")
+    PATTERN_TIMEOUT = re.compile(r"^timeout=(.*)$")
+    cals = []
+
+    for line in cfg:
+        m_cal = PATTERN_CAL.match(line)
+        m_xml = PATTERN_XML.match(line)
+        m_timeout = PATTERN_TIMEOUT.match(line)
+
+        if m_cal:
+            cals.append(GCal(m_cal.group(1)))
+        elif m_xml:
+            cals[-1].xml = m_xml.group(1)
+        elif m_timeout:
+            cals[-1].timeout = int(m_timeout.group(1)) * 60
+
+    for cal in cals:
+        cal.parse()
+        cal.output_org()

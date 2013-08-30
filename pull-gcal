@@ -315,28 +315,23 @@ class GCal:
                         + entry.end_time.strftime("%Y-%m-%d %a")\
                         + ">"
 
-###############
-# Entry point #
-###############
+if __name__ == "__main__":
+    with open(CFG_FILE) as cfg:
+        PATTERN_CAL = re.compile(r"^\[(.*)\]$")
+        PATTERN_XML = re.compile(r"^xml=(.*)$")
+        PATTERN_TIMEOUT = re.compile(r"^timeout=(.*)$")
+        cals = []
+        for line in cfg:
+            m_cal = PATTERN_CAL.match(line)
+            m_xml = PATTERN_XML.match(line)
+            m_timeout = PATTERN_TIMEOUT.match(line)
 
-with open(CFG_FILE) as cfg:
-    PATTERN_CAL = re.compile(r"^\[(.*)\]$")
-    PATTERN_XML = re.compile(r"^xml=(.*)$")
-    PATTERN_TIMEOUT = re.compile(r"^timeout=(.*)$")
-    cals = []
-
-    for line in cfg:
-        m_cal = PATTERN_CAL.match(line)
-        m_xml = PATTERN_XML.match(line)
-        m_timeout = PATTERN_TIMEOUT.match(line)
-
-        if m_cal:
-            cals.append(GCal(m_cal.group(1)))
-        elif m_xml:
-            cals[-1].xml = m_xml.group(1)
-        elif m_timeout:
-            cals[-1].timeout = int(m_timeout.group(1)) * 60
-
-    for cal in cals:
-        cal.parse()
-        cal.output_org()
+            if m_cal:
+                cals.append(GCal(m_cal.group(1)))
+            elif m_xml:
+                cals[-1].xml = m_xml.group(1)
+            elif m_timeout:
+                cals[-1].timeout = int(m_timeout.group(1)) * 60
+        for cal in cals:
+            cal.parse()
+            cal.output_org()
